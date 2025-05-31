@@ -2,7 +2,10 @@ use std::{collections::BTreeMap, fmt::Display, net::SocketAddr};
 
 use async_trait::async_trait;
 use bytes::Bytes;
-use mizaru2::{BlindedClientToken, BlindedSignature, ClientToken, UnblindedSignature};
+use mizaru2::{
+    BlindedClientToken, BlindedSignature, ClientToken, SingleBlindedSignature,
+    SingleUnblindedSignature, UnblindedSignature,
+};
 use nanorpc::nanorpc_derive;
 mod route;
 pub use route::*;
@@ -22,12 +25,14 @@ use thiserror::Error;
 #[async_trait]
 pub trait BrokerProtocol {
     async fn get_mizaru_subkey(&self, level: AccountLevel, epoch: u16) -> Bytes;
+
     async fn get_auth_token(&self, credential: Credential) -> Result<String, AuthError>;
     async fn get_user_info(&self, auth_token: String) -> Result<Option<UserInfo>, AuthError>;
     async fn get_user_info_by_cred(
         &self,
         credential: Credential,
     ) -> Result<Option<UserInfo>, AuthError>;
+
     async fn get_connect_token(
         &self,
         auth_token: String,
@@ -36,20 +41,40 @@ pub trait BrokerProtocol {
         blind_token: BlindedClientToken,
     ) -> Result<BlindedSignature, AuthError>;
 
-    async fn get_exits(&self) -> Result<Signed<ExitList>, GenericError>;
-    async fn get_free_exits(&self) -> Result<Signed<ExitList>, GenericError>;
+    async fn get_bw_token(
+        &self,
+        auth_token: String,
+        blind_token: BlindedClientToken,
+    ) -> Result<SingleBlindedSignature, AuthError>;
+
+    async fn consume_bw_token(
+        &self,
+        token: ClientToken,
+        sig: SingleUnblindedSignature,
+    ) -> Result<(), AuthError>;
+
+    async fn get_exits(&self) -> Result<StdcodeSigned<ExitList>, GenericError>;
+    async fn get_free_exits(&self) -> Result<StdcodeSigned<ExitList>, GenericError>;
+
+    /// Gets the network status. This is the newer endpoint that clients should use.
+    async fn get_net_status(&self) -> Result<JsonSigned<NetStatus>, GenericError>;
+
     async fn get_routes(
         &self,
         token: ClientToken,
         sig: UnblindedSignature,
         exit_b2e: SocketAddr,
     ) -> Result<RouteDescriptor, GenericError>;
-
     async fn get_routes_v2(&self, args: GetRoutesArgs) -> Result<RouteDescriptor, GenericError>;
 
     async fn insert_exit(
         &self,
-        descriptor: Mac<Signed<ExitDescriptor>>,
+        descriptor: Mac<StdcodeSigned<ExitDescriptor>>,
+    ) -> Result<(), GenericError>;
+
+    async fn insert_exit_v2(
+        &self,
+        descriptor: Mac<JsonSigned<(ExitDescriptor, ExitMetadata)>>,
     ) -> Result<(), GenericError>;
 
     async fn insert_bridge(&self, descriptor: Mac<BridgeDescriptor>) -> Result<(), GenericError>;
@@ -67,7 +92,10 @@ pub trait BrokerProtocol {
         puzzle: String,
         solution: String,
     ) -> Result<String, GenericError>;
+
     async fn upgrade_to_secret(&self, cred: Credential) -> Result<String, AuthError>;
+
+    async fn delete_account(&self, secret: String) -> Result<(), GenericError>;
 
     async fn get_news(&self, lang: String) -> Result<Vec<NewsItem>, GenericError>;
 
@@ -155,6 +183,8 @@ impl Default for Credential {
 }
 
 pub const DOMAIN_EXIT_DESCRIPTOR: &str = "exit-descriptor";
+
+pub const DOMAIN_NET_STATUS: &str = "net-status";
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
 #[serde(transparent)]

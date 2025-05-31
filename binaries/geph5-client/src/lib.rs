@@ -16,6 +16,8 @@ use once_cell::sync::OnceCell;
 
 mod auth;
 mod broker;
+mod bw_token;
+mod bw_accounting;
 mod china;
 mod client;
 mod client_inner;
@@ -149,10 +151,12 @@ mod tests {
                 BrokerSource::Fronted {
                     front: "https://www.cdn77.com/".into(),
                     host: "1826209743.rsc.cdn77.org".into(),
+                    override_dns: None,
                 },
                 BrokerSource::Fronted {
                     front: "https://vuejs.org/".into(),
                     host: "svitania-naidallszei-2.netlify.app".into(),
+                    override_dns: None,
                 },
             ])),
             broker_keys: Some(BrokerKeys {
@@ -161,6 +165,7 @@ mod tests {
                     .into(),
                 mizaru_plus: "cf6f58868c6d9459b3a63bc2bd86165631b3e916bad7f62b578cd9614e0bcb3b"
                     .into(),
+                mizaru_bw: "".to_string(),
             }),
             // Values that can be overridden by `args`:
             vpn: false,

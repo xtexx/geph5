@@ -27,15 +27,15 @@ impl TraffCount {
         }
     }
 
-    /// Create a new traffic counter with custom history length
-    pub fn with_history(max_seconds: usize) -> Self {
-        let now = Instant::now();
-        Self {
-            bins: VecDeque::with_capacity(max_seconds),
-            window_start: now,
-            max_history_seconds: max_seconds,
-        }
-    }
+    // /// Create a new traffic counter with custom history length
+    // pub fn with_history(max_seconds: usize) -> Self {
+    //     let now = Instant::now();
+    //     Self {
+    //         bins: VecDeque::with_capacity(max_seconds),
+    //         window_start: now,
+    //         max_history_seconds: max_seconds,
+    //     }
+    // }
 
     /// Increment the traffic count with the given number of bytes
     pub fn incr(&mut self, bytes: f64) {
@@ -87,11 +87,11 @@ impl TraffCount {
         self.bins.iter().cloned().collect()
     }
 
-    /// Remove measurements that are too old
-    fn cleanup(&mut self) {
-        let now = Instant::now();
-        self.ensure_bins_updated(now);
-    }
+    // /// Remove measurements that are too old
+    // fn cleanup(&mut self) {
+    //     let now = Instant::now();
+    //     self.ensure_bins_updated(now);
+    // }
 }
 
 impl Default for TraffCount {
@@ -103,7 +103,7 @@ impl Default for TraffCount {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::thread::sleep;
+    
 
     #[test]
     fn test_traffic_count_basic() {
@@ -119,23 +119,5 @@ mod tests {
 
         // The most recent entry should contain our traffic
         assert!(history.last().unwrap() > &0.0);
-    }
-
-    #[test]
-    fn test_traffic_cleanup() {
-        let mut counter = TraffCount::with_history(2); // Only keep 2 seconds of history
-
-        // Add initial traffic
-        counter.incr(100.0);
-
-        // Sleep to make the first measurement old
-        sleep(Duration::from_secs(3));
-
-        // Add new traffic
-        counter.incr(200.0);
-
-        // After sleeping for 3 seconds and adding more traffic,
-        // the history should be refreshed and the old bin removed
-        assert_eq!(counter.bins.len(), 1);
     }
 }

@@ -26,7 +26,17 @@ use std::{
 use stdcode::StdcodeSerializeExt;
 
 use crate::{
-    auth::get_connect_token, china::is_chinese_host, client::CtxField, control_prot::{ConnectedInfo, CURRENT_CONN_INFO}, get_dialer::get_dialer, spoof_dns::fake_dns_backtranslate, stats::{stat_incr_num, stat_set_num}, traffcount::TRAFF_COUNT, vpn::smart_vpn_whitelist, ConnInfo
+    auth::get_connect_token,
+    bw_accounting::bw_accounting_client_loop,
+    china::is_chinese_host,
+    client::CtxField,
+    control_prot::{ConnectedInfo, CURRENT_CONN_INFO},
+    get_dialer::get_dialer,
+    spoof_dns::fake_dns_backtranslate,
+    stats::{stat_incr_num, stat_set_num},
+    traffcount::TRAFF_COUNT,
+    vpn::smart_vpn_whitelist,
+    ConnInfo,
 };
 
 use super::Config;
@@ -111,7 +121,7 @@ static CONN_REQ_CHAN: CtxField<(
     (a, b)
 };
 
-pub static CONCURRENCY: usize = 3;
+pub static CONCURRENCY: usize = 10;
 
 #[tracing::instrument(skip_all)]
 pub async fn client_inner(ctx: AnyCtx<Config>) -> Infallible {
@@ -135,16 +145,18 @@ pub async fn client_inner(ctx: AnyCtx<Config>) -> Infallible {
                         let start = Instant::now();
                         let raw_pipe = raw_dialer.dial().await.context("could not dial")?;
                         tracing::debug!(
+                            instance,
                             elapsed = debug(start.elapsed()),
                             protocol = raw_pipe.protocol(),
                             "dial completed"
                         );
 
-                        let authed_pipe = client_auth(&ctx, raw_pipe, pubkey)
+                        let authed_pipe = client_auth(&ctx, raw_pipe, pubkey, instance)
                             .await
                             .context("could not client auth")?;
 
                         tracing::debug!(
+                            instance,
                             elapsed = debug(start.elapsed()),
                             "authentication done, starting mux system"
                         );
@@ -169,7 +181,7 @@ pub async fn client_inner(ctx: AnyCtx<Config>) -> Infallible {
 
                 };
                 if let Err(err) = once.await {
-                    let wait_time = Duration::from_secs_f64(rand::thread_rng().gen_range(1.0..10.0));
+                    let wait_time = Duration::from_secs_f64(rand::thread_rng().gen_range(0.0..1.0));
                     tracing::warn!(instance, err = debug(err), wait_time=debug(wait_time), "individual client thread failed");
                     smol::Timer::after(wait_time).await;
                 }
@@ -212,6 +224,7 @@ async fn proxy_loop(
 
     async {
         nursery!({
+
             loop {
                 let mux = mux.clone();
                 let ctx = ctx.clone();
@@ -238,14 +251,22 @@ async fn proxy_loop(
             }
         })
     }.or(mux.wait_until_dead())
+    .or(async {
+        if instance == 0 {
+            bw_accounting_client_loop(ctx.clone(), mux.open(b"!bw-accounting").await?).await
+        } else {
+            smol::future::pending().await
+        }
+    })
     .await
 }
 
-#[tracing::instrument(skip_all, fields(pubkey = hex::encode(pubkey.as_bytes())))]
+#[tracing::instrument(skip_all, fields(instance=instance, pubkey = hex::encode(pubkey.as_bytes())))]
 async fn client_auth(
     ctx: &AnyCtx<Config>,
     mut pipe: impl Pipe,
     pubkey: VerifyingKey,
+    instance: usize
 ) -> anyhow::Result<impl Pipe> {
     let server = pipe.remote_addr().unwrap_or("").to_string();
 

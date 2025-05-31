@@ -2,7 +2,7 @@ use std::{ops::Deref, str::FromStr, sync::LazyLock, time::Duration};
 
 use anyhow::Context;
 use async_io::Timer;
-use geph5_broker_protocol::BridgeDescriptor;
+use geph5_broker_protocol::{BridgeDescriptor, ExitMetadata};
 use moka::future::Cache;
 
 use rand::Rng;
@@ -12,6 +12,7 @@ use sqlx::{
     pool::PoolOptions,
     postgres::{PgConnectOptions, PgSslMode},
     prelude::FromRow,
+    types::Json,
     PgPool,
 };
 
@@ -20,7 +21,7 @@ use crate::CONFIG_FILE;
 pub static POSTGRES: LazyLock<PgPool> = LazyLock::new(|| {
     smolscale::block_on(
         PoolOptions::new()
-            .max_connections(1500)
+            .max_connections(300)
             .acquire_timeout(Duration::from_secs(60))
             .max_lifetime(Duration::from_secs(600))
             .connect_with({
@@ -67,6 +68,18 @@ pub struct ExitRow {
     pub expiry: i64,
 }
 
+#[derive(FromRow)]
+pub struct ExitRowWithMetadata {
+    pub pubkey: [u8; 32],
+    pub c2e_listen: String,
+    pub b2e_listen: String,
+    pub country: String,
+    pub city: String,
+    pub load: f32,
+    pub expiry: i64,
+    pub metadata: Option<Json<ExitMetadata>>,
+}
+
 pub async fn insert_exit(exit: &ExitRow) -> anyhow::Result<()> {
     sqlx::query(
         r"INSERT INTO exits_new (pubkey, c2e_listen, b2e_listen, country, city, load, expiry)
@@ -92,6 +105,25 @@ pub async fn insert_exit(exit: &ExitRow) -> anyhow::Result<()> {
     Ok(())
 }
 
+pub async fn insert_exit_metadata(pubkey: [u8; 32], metadata: ExitMetadata) -> anyhow::Result<()> {
+    sqlx::query("insert into exit_metadata (pubkey, metadata) values ($1, $2) on conflict (pubkey) do update set metadata = excluded.metadata")
+    .bind(pubkey)
+    .bind(Json(metadata))
+    .execute(POSTGRES.deref())
+    .await?;
+    Ok(())
+}
+
+pub async fn consume_bw(user_id: i32, mbs: i32) -> anyhow::Result<()> {
+    // TODO enforce limits
+    sqlx::query("update user_bw_limits set mb_used = mb_used + $2 where id = $1")
+        .bind(user_id)
+        .bind(mbs)
+        .execute(&*POSTGRES)
+        .await?;
+    Ok(())
+}
+
 pub async fn query_bridges(key: &str) -> anyhow::Result<Vec<(BridgeDescriptor, u32, bool)>> {
     // avoid unnecessarily overloading the backend by limiting concurrent route gets.
     static SEMAPH: Semaphore = Semaphore::new(100);
@@ -114,7 +146,7 @@ pub async fn query_bridges(key: &str) -> anyhow::Result<Vec<(BridgeDescriptor, u
             .unwrap(),
     );
     // increase cache hit rate limiting number of different keys
-    let key = key % 10000;
+    let key = key % 1000;
 
     CACHE
         .try_get_with(key, async {

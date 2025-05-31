@@ -19,7 +19,7 @@ use smol_timeout2::TimeoutExt;
 use stdcode::StdcodeSerializeExt;
 use sysinfo::System;
 
-use crate::CONFIG_FILE;
+use crate::{bw_accounting::BwAccount, CONFIG_FILE};
 
 static FREE_RL_CACHE: Lazy<Cache<blake3::Hash, RateLimiter>> = Lazy::new(|| {
     Cache::builder()
@@ -85,14 +85,24 @@ pub async fn get_ratelimiter(level: AccountLevel, token: ClientToken) -> RateLim
         AccountLevel::Free => {
             FREE_RL_CACHE
                 .get_with(blake3::hash(&(level, token).stdcode()), async {
-                    RateLimiter::new(CONFIG_FILE.wait().free_ratelimit, 100)
+                    RateLimiter::new(
+                        CONFIG_FILE.wait().free_ratelimit,
+                        100,
+                        BwAccount::unlimited(),
+                        None,
+                    )
                 })
                 .await
         }
         AccountLevel::Plus => {
             PLUS_RL_CACHE
                 .get_with(blake3::hash(&(level, token).stdcode()), async {
-                    RateLimiter::new(CONFIG_FILE.wait().plus_ratelimit, 100)
+                    RateLimiter::new(
+                        CONFIG_FILE.wait().plus_ratelimit,
+                        100,
+                        BwAccount::empty(),
+                        Some(token.to_string()),
+                    )
                 })
                 .await
         }
@@ -103,26 +113,53 @@ pub async fn get_ratelimiter(level: AccountLevel, token: ClientToken) -> RateLim
 #[derive(Clone)]
 pub struct RateLimiter {
     inner: Option<Arc<DefaultDirectRateLimiter>>,
+    log_tag: Option<String>,
+    bw_account: BwAccount,
 }
 
 impl RateLimiter {
     /// Creates a new rate limiter with the given speed limit, in B/s
-    pub fn new(limit_kb: u32, burst_kb: u32) -> Self {
+    pub fn new(
+        limit_kb: u32,
+        burst_kb: u32,
+        bw_account: BwAccount,
+        log_tag: Option<String>,
+    ) -> Self {
         let limit = NonZeroU32::new((limit_kb + 1) * 1024).unwrap();
         let burst_size = NonZeroU32::new(burst_kb * 1024).unwrap();
         let inner = governor::RateLimiter::direct(Quota::per_second(limit).allow_burst(burst_size));
         Self {
             inner: Some(Arc::new(inner)),
+            log_tag,
+            bw_account,
         }
     }
 
+    /// Gets the BwAccount out of this ratelimit
+    pub fn bw_account(&self) -> BwAccount {
+        self.bw_account.clone()
+    }
+
     /// Creates a new unlimited ratelimit.
-    pub fn unlimited() -> Self {
-        Self { inner: None }
+    pub fn unlimited(bw_account: BwAccount, log_tag: Option<String>) -> Self {
+        Self {
+            inner: None,
+            bw_account,
+            log_tag,
+        }
     }
 
     /// Waits until the given number of bytes can be let through.
     pub async fn wait(&self, bytes: usize) {
+        if let Some(tag) = &self.log_tag {
+            if rand::random::<f32>() < 0.000001 * bytes as f32 {
+                tracing::debug!("TOKEN {tag}");
+            }
+        }
+
+        // TODO do something when the bandwidth is exhausted
+        self.bw_account.consume_bw(bytes as usize);
+
         TOTAL_BYTE_COUNT.fetch_add(bytes as _, Ordering::Relaxed);
         if bytes == 0 {
             return;
@@ -130,8 +167,10 @@ impl RateLimiter {
         let multiplier = (1.0 / (1.0 - get_load().min(0.999)) - 1.0) / 2.0;
 
         let bytes = (bytes as f32 * (multiplier.max(1.0))).min(100000.0);
+
         if let Some(inner) = &self.inner {
             let mut delay: f32 = 0.005;
+
             while inner
                 .check_n((bytes as u32).try_into().unwrap())
                 .unwrap()
