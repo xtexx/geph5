@@ -4,28 +4,24 @@ use clap::Parser;
 use database::database_gc_loop;
 use ed25519_dalek::SigningKey;
 
+use moka::future::Cache;
 use nano_influxdb::InfluxDbEndpoint;
-use nanorpc::{JrpcRequest, JrpcResponse, RpcService};
+use nanorpc::{JrpcId, JrpcRequest, JrpcResponse, RpcService};
 use once_cell::sync::{Lazy, OnceCell};
 
+use database::self_stat::self_stat_loop;
 use rpc_impl::WrappedBrokerService;
-use self_stat::self_stat_loop;
 use serde::Deserialize;
 use smolscale::immortal::{Immortal, RespawnStrategy};
-use std::{fmt::Debug, fs, net::SocketAddr, path::PathBuf, sync::LazyLock};
+use std::{fmt::Debug, fs, net::SocketAddr, path::PathBuf, sync::LazyLock, time::Duration};
 use tikv_jemallocator::Jemalloc;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilter};
 
-mod auth;
 mod database;
-
-mod free_voucher;
 mod news;
 mod payments;
-mod puzzle;
 mod routes;
 mod rpc_impl;
-mod self_stat;
 
 #[global_allocator]
 static GLOBAL: Jemalloc = Jemalloc;
@@ -63,6 +59,14 @@ static FREE_MIZARU_SK: Lazy<mizaru2::SecretKey> = Lazy::new(|| {
     mizaru
 });
 
+/// The bandwidth mizaru SK.
+static BW_MIZARU_SK: Lazy<mizaru2::SingleSecretKey> = Lazy::new(|| {
+    let mizaru = load_mizaru_single_sk("bw.bin");
+    let pk = mizaru.to_public_key();
+    tracing::info!("*** Bandwidth Mizaru PK = {} ***", hex::encode(pk.to_der()));
+    mizaru
+});
+
 fn load_mizaru_sk(name: &str) -> mizaru2::SecretKey {
     let mizaru_keys_dir = &CONFIG_FILE.wait().mizaru_keys;
     let plus_file_path = mizaru_keys_dir.join(name);
@@ -74,6 +78,25 @@ fn load_mizaru_sk(name: &str) -> mizaru2::SecretKey {
     } else {
         // If the file doesn't exist, generate a new secret key and write it to the file
         let new_key = mizaru2::SecretKey::generate(name);
+        if let Some(parent) = plus_file_path.parent() {
+            fs::create_dir_all(parent).unwrap();
+        }
+        fs::write(&plus_file_path, stdcode::serialize(&new_key).unwrap()).unwrap();
+        new_key
+    }
+}
+
+fn load_mizaru_single_sk(name: &str) -> mizaru2::SingleSecretKey {
+    let mizaru_keys_dir = &CONFIG_FILE.wait().mizaru_keys;
+    let plus_file_path = mizaru_keys_dir.join(name);
+
+    if plus_file_path.exists() {
+        // If the file exists, read it
+        let file_content = fs::read(&plus_file_path).unwrap();
+        stdcode::deserialize(&file_content).unwrap()
+    } else {
+        // If the file doesn't exist, generate a new secret key and write it to the file
+        let new_key = mizaru2::SingleSecretKey::generate(name);
         if let Some(parent) = plus_file_path.parent() {
             fs::create_dir_all(parent).unwrap();
         }
@@ -166,7 +189,7 @@ async fn main() -> anyhow::Result<()> {
 
     Lazy::force(&PLUS_MIZARU_SK);
     Lazy::force(&FREE_MIZARU_SK);
-    LazyLock::force(&database::POSTGRES);
+    Lazy::force(&BW_MIZARU_SK);
 
     let _gc_loop = Immortal::respawn(RespawnStrategy::Immediate, database_gc_loop);
     let _self_stat_loop = Immortal::respawn(RespawnStrategy::Immediate, self_stat_loop);
@@ -186,7 +209,25 @@ async fn main() -> anyhow::Result<()> {
 }
 
 async fn rpc(Json(payload): Json<JrpcRequest>) -> Json<JrpcResponse> {
-    Json(WrappedBrokerService::new().respond_raw(payload).await)
+    // we assume the JrpcRequest IDs are reasonably unique, so we use this technique to deduplicate duplicate requests. Duplicate requests often happen when multiple different broker sources race against each other on censored networks.
+    static DEDUP_CACHE: LazyLock<Cache<(JrpcId, String), JrpcResponse>> = LazyLock::new(|| {
+        Cache::builder()
+            .time_to_live(Duration::from_secs(10))
+            .build()
+    });
+
+    if rand::random::<f32>() < 0.001 {
+        tracing::debug!("{} entries in DEDUP_CACHE", DEDUP_CACHE.entry_count());
+    }
+
+    let resp = DEDUP_CACHE
+        .get_with(
+            (payload.id.clone(), payload.method.clone()),
+            WrappedBrokerService::new().respond_raw(payload),
+        )
+        .await;
+
+    Json(resp)
 }
 
 fn log_error(e: &impl Debug) {
