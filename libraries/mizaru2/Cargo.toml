@@ -2,7 +2,7 @@
 name = "mizaru2"
 edition = "2021"
 description = "Mizaru2"
-version = "0.2.13"
+version = "0.2.14"
 repository.workspace = true
 license.workspace = true
 
@@ -12,6 +12,6 @@ blind-rsa-signatures = "0.15.1"
 rand = "0.8.5"
 stdcode = "0.1.14"
 serde = { version = "1.0.204", features = ["derive", "rc"] }
-anyhow = "1.0.86"
+thiserror = "1.0.61"
 rayon = "1.10.0"
 hex = "0.4.3"

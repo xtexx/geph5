@@ -66,12 +66,25 @@ pub async fn bridge_to_leaf_route(
                     .await?
                 });
 
-                if bridge.pool.contains("waw") || country == "IR" || country == "TM" {
+                defmac!(foofoo_route => {
+                    bridge_to_leaf_route_inner(
+                        bridge.clone(),
+                        exit.b2e_listen,
+                        ObfsProtocol::Sosistab3New(gencookie(), ObfsProtocol::ConnTest(ObfsProtocol::None.into()).into()),
+                    )
+                    .await?
+                });
+
+                if bridge.pool.contains("waw")
+                    || bridge.pool.contains("ovh_de")
+                    || country == "IR"
+                    || country == "TM"
+                {
                     anyhow::Ok(RouteDescriptor::Delay {
                         milliseconds: delay_ms,
                         lower: tls_route!().into(),
                     })
-                } else if !country.is_empty() {
+                } else if !country.is_empty(){
                     anyhow::Ok(RouteDescriptor::Delay {
                         milliseconds: delay_ms,
                         lower: sosistab3_route!().into(),
@@ -79,7 +92,7 @@ pub async fn bridge_to_leaf_route(
                 } else {
                     anyhow::Ok(RouteDescriptor::Delay {
                         milliseconds: delay_ms,
-                        lower: RouteDescriptor::Fallback(vec![sosistab3_route!(), legacy_route!()])
+                        lower: RouteDescriptor::Fallback(vec![tls_route!(), sosistab3_route!(), legacy_route!()])
                             .into(),
                     })
                 }

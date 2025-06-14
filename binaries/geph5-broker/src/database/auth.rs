@@ -5,7 +5,6 @@ use geph5_broker_protocol::{AccountLevel, AuthError, Credential, UserInfo};
 
 use std::{
     collections::BTreeMap,
-    ops::Deref as _,
     sync::{Arc, LazyLock},
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
@@ -14,8 +13,8 @@ use moka::future::Cache;
 use rand::Rng as _;
 use sqlx::types::chrono::Utc;
 
+use super::POSTGRES;
 use crate::{
-    database::POSTGRES,
     log_error,
     payments::{PaymentClient, PaymentTransport},
     CONFIG_FILE,
@@ -66,11 +65,19 @@ pub async fn register_secret(user_id: Option<i32>) -> anyhow::Result<String> {
         .execute(&mut *txn)
         .await?;
 
-        let code = PaymentClient(PaymentTransport)
-            .create_giftcard(CONFIG_FILE.wait().payment_support_secret.clone(), 1)
-            .await?
-            .map_err(|e| anyhow::anyhow!(e))?;
-        sqlx::query(
+        let uname: Option<String> =
+            sqlx::query_scalar("select username from auth_password where user_id = $1")
+                .bind(user_id)
+                .fetch_optional(&mut *txn)
+                .await?;
+        if let Some(uname) = uname {
+            tracing::debug!("upgrading legacy username {uname} with a free gift");
+
+            let code = PaymentClient(PaymentTransport)
+                .create_giftcard(CONFIG_FILE.wait().payment_support_secret.clone(), 1)
+                .await?
+                .map_err(|e| anyhow::anyhow!(e))?;
+            sqlx::query(
                 r#"
             INSERT INTO free_vouchers (id, voucher, description, visible_after)
             VALUES ($1, $2, $3, (select coalesce(max(visible_after) + '1 second', NOW()) from free_vouchers))
@@ -78,16 +85,16 @@ pub async fn register_secret(user_id: Option<i32>) -> anyhow::Result<String> {
             )
             .bind(user_id)
             .bind(code.clone())
-            .bind(include_str!("free_voucher_description.json"))
+            .bind(include_str!("../free_voucher_description.json"))
             .execute(&mut *txn)
             .await?;
+        }
 
         txn.commit().await?;
         Ok(secret)
     }
 }
 
-#[cached(time = 86400, result = true)]
 pub async fn validate_credential(credential: Credential) -> Result<i32, AuthError> {
     match credential {
         Credential::TestDummy => Err(AuthError::Forbidden),
@@ -104,7 +111,7 @@ pub async fn validate_secret(secret: &str) -> Result<i32, AuthError> {
     // Query the DB to see if any row matches this hash.
     let res: Option<(i32,)> = sqlx::query_as("SELECT id FROM auth_secret WHERE secret = $1")
         .bind(secret)
-        .fetch_optional(POSTGRES.deref())
+        .fetch_optional(&*POSTGRES)
         .await
         .inspect_err(log_error)
         .map_err(|_| AuthError::RateLimited)?;
@@ -122,7 +129,7 @@ pub async fn validate_username_pwd(username: &str, password: &str) -> Result<i32
     let res: Option<(i32, String)> =
         sqlx::query_as("select user_id,pwdhash from auth_password where username = $1")
             .bind(username)
-            .fetch_optional(POSTGRES.deref())
+            .fetch_optional(&*POSTGRES)
             .await
             .inspect_err(log_error)
             .map_err(|_| AuthError::RateLimited)?;
@@ -153,7 +160,7 @@ pub async fn new_auth_token(user_id: i32) -> anyhow::Result<String> {
     match sqlx::query("INSERT INTO auth_tokens (token, user_id) VALUES ($1, $2)")
         .bind(&token)
         .bind(user_id)
-        .execute(POSTGRES.deref())
+        .execute(&*POSTGRES)
         .await
     {
         Ok(_) => Ok(token),
@@ -166,7 +173,7 @@ async fn get_user_id_from_token(token: String) -> anyhow::Result<Option<i32>> {
     let user_id: Option<(i32,)> =
         sqlx::query_as("SELECT user_id FROM auth_tokens WHERE token = $1")
             .bind(token)
-            .fetch_optional(POSTGRES.deref())
+            .fetch_optional(&*POSTGRES)
             .await?;
 
     Ok(user_id.map(|(user_id,)| user_id))
@@ -203,13 +210,13 @@ pub async fn get_user_info(user_id: i32) -> Result<Option<UserInfo>, AuthError> 
 }
 
 pub async fn get_subscription_expiry(user_id: i32) -> anyhow::Result<Option<(i64, bool)>> {
-    static ALL_SUBSCRIPTIONS_CACHE: LazyLock<Cache<i64, Arc<BTreeMap<i32, (i64, bool)>>>> =
+    static ALL_SUBSCRIPTIONS_CACHE: LazyLock<Cache<i32, Arc<BTreeMap<i32, (i64, bool)>>>> =
         LazyLock::new(|| {
             Cache::builder()
                 .time_to_idle(Duration::from_secs(60))
                 .build()
         });
-    static LAST_PAYMENT_TIMESTAMP_CACHE: LazyLock<Cache<u128, i64>> = LazyLock::new(|| {
+    static PERIOD_COUNT_CACHE: LazyLock<Cache<u128, i32>> = LazyLock::new(|| {
         Cache::builder()
             .time_to_idle(Duration::from_secs(60))
             .build()
@@ -217,7 +224,7 @@ pub async fn get_subscription_expiry(user_id: i32) -> anyhow::Result<Option<(i64
     let start = Instant::now();
 
     let mut ts_missed = false;
-    let last_payment_timestamp = LAST_PAYMENT_TIMESTAMP_CACHE
+    let period_count = PERIOD_COUNT_CACHE
         .try_get_with(
             SystemTime::now()
                 .duration_since(UNIX_EPOCH)
@@ -225,11 +232,9 @@ pub async fn get_subscription_expiry(user_id: i32) -> anyhow::Result<Option<(i64
                 .as_millis()
                 / 500,
             async {
-                let ts = sqlx::query_scalar::<_, i64>(
-                    "SELECT EXTRACT(EPOCH FROM MAX(created_at))::bigint FROM payment_events",
-                )
-                .fetch_one(POSTGRES.deref())
-                .await?;
+                let ts = sqlx::query_scalar::<_, i32>("SELECT max(period_id) FROM plus_periods")
+                    .fetch_one(&*POSTGRES)
+                    .await?;
                 ts_missed = true;
                 anyhow::Ok(ts)
             },
@@ -239,16 +244,16 @@ pub async fn get_subscription_expiry(user_id: i32) -> anyhow::Result<Option<(i64
 
     let mut sub_missed = false;
     let all_subscriptions = ALL_SUBSCRIPTIONS_CACHE
-        .try_get_with(last_payment_timestamp, async {
+        .try_get_with(period_count, async {
             let all_subscriptions: Vec<(i32, i64, bool)> = sqlx::query_as(
                 "SELECT 
     s.id, 
     EXTRACT(EPOCH FROM s.expires)::bigint AS unix_timestamp,
     (r.user_id IS NOT NULL) AS has_recurring
 FROM subscriptions s
-LEFT JOIN recurring_subs r ON s.id = r.user_id",
+LEFT JOIN stripe_recurring r ON s.id = r.user_id",
             )
-            .fetch_all(POSTGRES.deref())
+            .fetch_all(&*POSTGRES)
             .await?;
             sub_missed = true;
             anyhow::Ok(Arc::new(
@@ -282,8 +287,16 @@ DO UPDATE SET login_time = EXCLUDED.login_time;
     )
     .bind(user_id)
     .bind(now)
-    .execute(POSTGRES.deref())
+    .execute(&*POSTGRES)
     .await?;
 
+    Ok(())
+}
+
+pub async fn delete_user_by_secret(secret: &str) -> anyhow::Result<()> {
+    sqlx::query("delete from users where id=(select id from auth_secret where secret=$1)")
+        .bind(secret)
+        .execute(&*POSTGRES)
+        .await?;
     Ok(())
 }

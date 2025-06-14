@@ -8,9 +8,10 @@ use async_native_tls::TlsConnector;
 use ed25519_dalek::VerifyingKey;
 
 use geph5_broker_protocol::{
-    AccountLevel, ExitDescriptor, ExitList, GetRoutesArgs, RouteDescriptor, DOMAIN_EXIT_DESCRIPTOR,
+    AccountLevel, ExitCategory, ExitDescriptor, GetRoutesArgs, NetStatus, RouteDescriptor,
 };
 use isocountry::CountryCode;
+use itertools::Itertools;
 use ordered_float::OrderedFloat;
 use rand::seq::SliceRandom;
 use serde::{Deserialize, Serialize};
@@ -25,7 +26,7 @@ use smol_timeout2::TimeoutExt as _;
 
 use crate::{
     auth::get_connect_token,
-    broker::broker_client,
+    broker::{broker_client, get_net_status},
     client::{Config, CtxField},
     device_metadata::get_device_metadata,
     vpn::smart_vpn_whitelist,
@@ -51,17 +52,12 @@ pub async fn get_dialer(
     let mut cached_value = ctx.get(SEMAPH).lock().await;
 
     if let Some(inner) = cached_value.clone() {
-        if inner.3.elapsed()? < Duration::from_secs(10) {
-            tracing::debug!("returning very recently cached dialer");
+        if inner.3.elapsed()? < Duration::from_secs(120) {
             return Ok((inner.0, inner.1, inner.2));
         }
     }
 
-    let res = get_dialer_inner(ctx)
-        .timeout(Duration::from_secs(15))
-        .await
-        .ok_or_else(|| anyhow::anyhow!("get_dialer_inner timed out"))
-        .and_then(|x| x);
+    let res = get_dialer_inner(ctx).await;
     match res {
         Ok(val) => {
             *cached_value = Some((val.0, val.1.clone(), val.2.clone(), SystemTime::now()));
@@ -122,28 +118,27 @@ async fn get_dialer_inner(
         .await
         .context("could not get connect token")?;
 
-    let broker = broker_client(ctx).context("could not get broker client")?;
-    let exits_response = match level {
-        AccountLevel::Plus => broker.get_exits().await,
-        AccountLevel::Free => broker.get_free_exits().await,
-    }?
-    .map_err(|e| anyhow::anyhow!("broker refused to serve exits: {e}"))?;
+    let net_status_verified = get_net_status(ctx).await?;
 
-    // Verify the broker's signature over the exit list:
-    let exits_verified = exits_response
-        .verify(DOMAIN_EXIT_DESCRIPTOR, |their_pk| {
-            if let Some(broker_pk) = &ctx.init().broker_keys {
-                hex::encode(their_pk.as_bytes()) == broker_pk.master
-            } else {
-                true
-            }
-        })
-        .context("could not verify exits")?;
+    tracing::debug!(
+        "verified netstatus: {}",
+        serde_json::to_string(
+            &net_status_verified
+                .exits
+                .iter()
+                .map(|s| &s.1 .1)
+                .collect_vec()
+        )?
+    );
 
     // Use our new helper function to pick the best exit:
     let rendezvous_key = blake3::hash(serde_json::to_string(&ctx.init().credentials)?.as_bytes());
-    let (pubkey, exit) =
-        pick_exit_with_constraint(rendezvous_key, &ctx.init().exit_constraint, &exits_verified)?;
+    let (pubkey, exit) = pick_exit_with_constraint(
+        rendezvous_key,
+        &ctx.init().exit_constraint,
+        level,
+        &net_status_verified,
+    )?;
 
     tracing::debug!(exit = ?exit, "narrowed down choice of exit");
     smart_vpn_whitelist(ctx, exit.c2e_listen.ip());
@@ -164,6 +159,7 @@ async fn get_dialer_inner(
     };
 
     // Also get potential “bridge routes”:
+    let broker = broker_client(ctx)?;
     let bridge_routes = broker
         .get_routes_v2(GetRoutesArgs {
             token: conn_token,
@@ -188,10 +184,10 @@ async fn get_dialer_inner(
 fn pick_exit_with_constraint<'a>(
     rendezvous_key: blake3::Hash,
     constraint: &ExitConstraint,
-    exits_verified: &'a ExitList,
+    level: AccountLevel,
+    net_status: &'a NetStatus,
 ) -> anyhow::Result<(&'a VerifyingKey, &'a ExitDescriptor)> {
-    // Extract the underlying HashMap from your verification struct
-    let all_exits = &exits_verified.all_exits;
+    let all_exits = net_status.exits.values();
 
     // Figure out which fields we need to match
     let mut country_constraint = None;
@@ -199,12 +195,8 @@ fn pick_exit_with_constraint<'a>(
     let mut hostname_constraint = None;
 
     match constraint {
-        ExitConstraint::Hostname(host) => {
-            hostname_constraint = Some(host.clone());
-        }
-        ExitConstraint::Country(country) => {
-            country_constraint = Some(*country);
-        }
+        ExitConstraint::Hostname(host) => hostname_constraint = Some(host.clone()),
+        ExitConstraint::Country(country) => country_constraint = Some(*country),
         ExitConstraint::CountryCity(country, city) => {
             country_constraint = Some(*country);
             city_constraint = Some(city.clone());
@@ -213,25 +205,27 @@ fn pick_exit_with_constraint<'a>(
         ExitConstraint::Direct(_) => panic!("should not reach here"),
     }
 
-    // Filter down to those that match. If none match, we pick the global minimum load.
-    let filtered = all_exits
-        .iter()
-        .filter(|(_, exit)| {
-            let country_pass = match country_constraint {
+    let filtered: Vec<_> = all_exits
+        .filter(|(_, exit, meta)| {
+            let mut pass = match country_constraint {
                 Some(c) => exit.country == c,
                 None => true,
             };
-            let city_pass = match &city_constraint {
+            pass &= match &city_constraint {
                 Some(city) => exit.city == *city,
                 None => true,
             };
-            let hostname_pass = match &hostname_constraint {
+            pass &= match &hostname_constraint {
                 Some(hn) => exit.b2e_listen.ip().to_string() == *hn,
                 None => true,
             };
-            country_pass && city_pass && hostname_pass
+            if matches!(constraint, ExitConstraint::Auto) {
+                pass &= meta.category == ExitCategory::Core;
+            }
+            pass &= meta.allowed_levels.contains(&level);
+            pass
         })
-        .collect::<Vec<_>>();
+        .collect();
 
     if filtered.is_empty() {
         anyhow::bail!("no exits match the constraints")
@@ -241,21 +235,15 @@ fn pick_exit_with_constraint<'a>(
     let first = filtered
         .iter()
         .min_by_key(|rh| {
+            let (_, exit, _) = **rh;
             let hash = blake3::keyed_hash(
                 rendezvous_key.as_bytes(),
-                &rh.1.b2e_listen.ip().to_string().as_bytes()[..],
+                exit.b2e_listen.ip().to_string().as_bytes(),
             );
             let hash = &hash.as_bytes()[..];
             let hash = u64::from_be_bytes(*array_ref![hash, 0, 8]) as f64 / u64::MAX as f64;
-            let weight = (1.0 - (rh.1.load as f64)).powi(2);
+            let weight = (1.0 - (exit.load as f64)).powi(2);
             let picker = -hash.ln() / weight;
-            tracing::debug!(
-                "picking exit, {}/{}/{} => {:.5}",
-                rh.1.country,
-                rh.1.city,
-                rh.1.b2e_listen.ip(),
-                picker
-            );
             OrderedFloat(picker)
         })
         .unwrap();

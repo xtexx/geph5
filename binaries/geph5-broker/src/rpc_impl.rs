@@ -7,18 +7,21 @@ use ed25519_dalek::VerifyingKey;
 use futures_util::{future::join_all, TryFutureExt};
 use geph5_broker_protocol::{
     AccountLevel, AuthError, AvailabilityData, BridgeDescriptor, BrokerProtocol, BrokerService,
-    Credential, ExitDescriptor, ExitList, GenericError, GetRoutesArgs, Mac, NewsItem,
-    RouteDescriptor, Signed, UserInfo, VoucherInfo, DOMAIN_EXIT_DESCRIPTOR,
+    Credential, ExitCategory, ExitDescriptor, ExitList, ExitMetadata, GenericError, GetRoutesArgs,
+    JsonSigned, Mac, NetStatus, LegacyNewsItem, RouteDescriptor, StdcodeSigned, UserInfo, VoucherInfo,
+    DOMAIN_EXIT_DESCRIPTOR, DOMAIN_NET_STATUS,
 };
 use geph5_ip_to_asn::ip_to_asn_country;
 use influxdb_line_protocol::LineProtocolBuilder;
 use isocountry::CountryCode;
-use mizaru2::{BlindedClientToken, BlindedSignature, ClientToken, UnblindedSignature};
+use mizaru2::{
+    BlindedClientToken, BlindedSignature, ClientToken, SingleBlindedSignature,
+    SingleUnblindedSignature, UnblindedSignature,
+};
 use moka::future::Cache;
 use nanorpc::{RpcService, ServerError};
 use once_cell::sync::Lazy;
-use smol::lock::Semaphore;
-use smol_timeout2::TimeoutExt;
+
 use std::net::Ipv4Addr;
 use std::str::FromStr as _;
 use std::sync::atomic::AtomicU64;
@@ -30,20 +33,23 @@ use std::{
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
-use crate::{
-    auth::{get_user_info, register_secret, validate_credential},
+use crate::database::auth::validate_secret;
+use crate::database::{
+    auth::{get_user_info, new_auth_token, register_secret, valid_auth_token, validate_credential},
+    bandwidth::consume_bw,
+    bridges::query_bridges,
+    exits::{insert_exit, insert_exit_metadata, ExitRow, ExitRowWithMetadata},
     free_voucher::{delete_free_voucher, get_free_voucher},
+    puzzle::{new_puzzle, verify_puzzle_solution},
+};
+use crate::BW_MIZARU_SK;
+use crate::{
     log_error,
     news::fetch_news,
     payments::{
         payment_sessid, GiftcardWireInfo, PaymentClient, PaymentTransport, StartAliwechatArgs,
         StartStripeArgs,
     },
-    puzzle::{new_puzzle, verify_puzzle_solution},
-};
-use crate::{
-    auth::{new_auth_token, valid_auth_token},
-    database::{insert_exit, query_bridges, ExitRow, POSTGRES},
     routes::bridge_to_leaf_route,
     CONFIG_FILE, FREE_MIZARU_SK, MASTER_SECRET, PLUS_MIZARU_SK,
 };
@@ -88,56 +94,60 @@ impl RpcService for WrappedBrokerService {
 struct BrokerImpl {}
 
 impl BrokerImpl {
-    async fn get_all_exits(&self) -> Result<ExitList, GenericError> {
-        static EXIT_CACHE: Lazy<Cache<(), ExitList>> = Lazy::new(|| {
+    async fn net_status_inner(&self) -> Result<NetStatus, GenericError> {
+        static CACHE: Lazy<Cache<(), NetStatus>> = Lazy::new(|| {
             Cache::builder()
                 .time_to_live(Duration::from_secs(10))
                 .build()
         });
 
-        let exit_list = EXIT_CACHE
+        let ns = CACHE
             .try_get_with((), async {
-                let exits: Vec<(VerifyingKey, ExitDescriptor)> =
-                    sqlx::query_as("select * from exits_new")
-                        .fetch_all(POSTGRES.deref())
-                        .await?
-                        .into_iter()
-                        .map(|row: ExitRow| {
-                            (
-                                VerifyingKey::from_bytes(&row.pubkey).unwrap(),
-                                ExitDescriptor {
-                                    c2e_listen: row.c2e_listen.parse().unwrap(),
-                                    b2e_listen: row.b2e_listen.parse().unwrap(),
-                                    country: CountryCode::for_alpha2_caseless(&row.country)
-                                        .unwrap(),
-                                    city: row.city,
-                                    load: row.load,
-                                    expiry: row.expiry as _,
-                                },
-                            )
-                        })
-                        .collect();
-                let exit_list = ExitList {
-                    all_exits: exits,
-                    city_names: serde_yaml::from_str(include_str!("city_names.yaml")).unwrap(),
-                };
-                Ok(exit_list)
+                let exits: Vec<ExitRowWithMetadata> =
+                    crate::database::exits::list_with_metadata().await?;
+                let exits = exits
+                    .into_iter()
+                    .map(|row| {
+                        let vk = VerifyingKey::from_bytes(&row.pubkey).unwrap();
+                        let desc = ExitDescriptor {
+                            c2e_listen: row.c2e_listen.parse().unwrap(),
+                            b2e_listen: row.b2e_listen.parse().unwrap(),
+                            country: CountryCode::for_alpha2_caseless(&row.country).unwrap(),
+                            city: row.city,
+                            load: row.load,
+                            expiry: row.expiry as _,
+                        };
+                        let meta = row
+                            .metadata
+                            .map(|j| j.0)
+                            .unwrap_or_else(|| default_exit_metadata(&desc.country));
+                        (hex::encode(vk.as_bytes()), (vk, desc, meta))
+                    })
+                    .collect();
+                Ok(NetStatus { exits })
             })
             .await
             .map_err(|e: Arc<GenericError>| e.deref().clone())?;
-        Ok(exit_list)
+        Ok(ns)
     }
 }
 
-fn is_plus_exit(exit: &ExitDescriptor) -> bool {
-    !matches!(
-        exit.country,
+fn default_exit_metadata(country: &CountryCode) -> ExitMetadata {
+    let mut allowed_levels = vec![AccountLevel::Plus];
+    if matches!(
+        country,
         CountryCode::CAN
             | CountryCode::NLD
             | CountryCode::FRA
             | CountryCode::POL
             | CountryCode::DEU
-    )
+    ) {
+        allowed_levels.push(AccountLevel::Free);
+    }
+    ExitMetadata {
+        allowed_levels,
+        category: ExitCategory::Core,
+    }
 }
 
 #[async_trait]
@@ -164,6 +174,24 @@ impl BrokerProtocol for BrokerImpl {
             .map_err(|_| AuthError::RateLimited)?;
 
         Ok(token)
+    }
+
+    async fn get_bw_token(
+        &self,
+        auth_token: String,
+        blind_token: BlindedClientToken,
+    ) -> Result<SingleBlindedSignature, AuthError> {
+        let (id, _) = valid_auth_token(auth_token)
+            .await
+            .map_err(|_| AuthError::RateLimited)?
+            .ok_or(AuthError::Forbidden)?;
+
+        consume_bw(id, 10)
+            .await
+            .map_err(|_| AuthError::RateLimited)?;
+
+        let sig = BW_MIZARU_SK.blind_sign(&blind_token);
+        Ok(sig)
     }
 
     async fn get_connect_token(
@@ -207,9 +235,9 @@ impl BrokerProtocol for BrokerImpl {
         let count = counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         tracing::debug!(user_id, count, "authenticated auth token");
         // exempt special testing account
-        if count > 10 && user_id != 9311416 {
+        if count > 20 && user_id != 9311416 {
             tracing::warn!(user_id, count, "too many auths in the last day, rejecting");
-            counter.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+
             return Err(AuthError::RateLimited);
         }
         let start = Instant::now();
@@ -226,20 +254,43 @@ impl BrokerProtocol for BrokerImpl {
         Ok(signed)
     }
 
-    async fn get_exits(&self) -> Result<Signed<ExitList>, GenericError> {
-        let exit_list = self.get_all_exits().await?;
-
-        Ok(Signed::new(
+    /// This is a LEGACY endpoint!!
+    async fn get_exits(&self) -> Result<StdcodeSigned<ExitList>, GenericError> {
+        let ns = self.net_status_inner().await?;
+        let all_exits = ns
+            .exits
+            .into_values()
+            .filter(|(_, _, meta)| meta.category == ExitCategory::Core)
+            .map(|(vk, desc, _)| (vk, desc))
+            .collect();
+        let exit_list = ExitList {
+            all_exits,
+            city_names: serde_yaml::from_str(include_str!("city_names.yaml")).unwrap(),
+        };
+        Ok(StdcodeSigned::new(
             exit_list,
             DOMAIN_EXIT_DESCRIPTOR,
             MASTER_SECRET.deref(),
         ))
     }
 
-    async fn get_free_exits(&self) -> Result<Signed<ExitList>, GenericError> {
-        let mut exit_list = self.get_all_exits().await?;
-        exit_list.all_exits.retain(|(_, e)| !is_plus_exit(e));
-        Ok(Signed::new(
+    /// This is a LEGACY endpoint!!
+    async fn get_free_exits(&self) -> Result<StdcodeSigned<ExitList>, GenericError> {
+        let ns = self.net_status_inner().await?;
+        let all_exits = ns
+            .exits
+            .into_values()
+            .filter(|(_, _, meta)| {
+                meta.allowed_levels.contains(&AccountLevel::Free)
+                    && meta.category == ExitCategory::Core
+            })
+            .map(|(vk, desc, _)| (vk, desc))
+            .collect();
+        let exit_list = ExitList {
+            all_exits,
+            city_names: serde_yaml::from_str(include_str!("city_names.yaml")).unwrap(),
+        };
+        Ok(StdcodeSigned::new(
             exit_list,
             DOMAIN_EXIT_DESCRIPTOR,
             MASTER_SECRET.deref(),
@@ -280,26 +331,22 @@ impl BrokerProtocol for BrokerImpl {
 
         // get the exit
         let exit = self
-            .get_all_exits()
+            .net_status_inner()
             .await?
-            .all_exits
-            .into_iter()
-            .map(|s| s.1)
+            .exits
+            .into_values()
+            .map(|(_, d, _)| d)
             .find(|exit| exit.b2e_listen == args.exit_b2e)
             .context("cannot find this exit")?;
 
         // for known good countries, we return a direct route!
         let mut direct_route = None;
-        let country = if let Some(ip_addr) = args.client_metadata["ip_addr"]
+        let (asn, country) = if let Some(ip_addr) = args.client_metadata["ip_addr"]
             .as_str()
             .and_then(|ip_addr| Ipv4Addr::from_str(ip_addr).ok())
         {
             let (asn, country) = ip_to_asn_country(ip_addr).await?;
-            tracing::debug!(
-                asn,
-                country = display(&country),
-                "obtaining route with metadata"
-            );
+
             if country != "TM" && country != "IR" && country != "RU" && country != "CN" {
                 // return a DIRECT route!
                 direct_route = Some(RouteDescriptor::ConnTest {
@@ -307,9 +354,9 @@ impl BrokerProtocol for BrokerImpl {
                     lower: RouteDescriptor::Tcp(exit.c2e_listen).into(),
                 });
             }
-            country
+            (asn, country)
         } else {
-            "".to_string()
+            (0, "".to_string())
         };
 
         let raw_descriptors = query_bridges(&format!("{:?}", args.token)).await?;
@@ -326,7 +373,8 @@ impl BrokerProtocol for BrokerImpl {
         let raw_descriptors = raw_descriptors.into_iter().filter(|desc| {
             // for China Plus users, filter out ovh
             if account_level == AccountLevel::Plus && country == "CN" {
-                return !desc.0.pool.contains("ovh");
+                return !desc.0.pool.contains("ovh")
+                    && !((asn == 4808 || asn == 4837) && desc.0.pool == "yaofan-hk");
             }
             // TM-only bridges
             if desc.0.pool.contains("TM") {
@@ -382,9 +430,22 @@ impl BrokerProtocol for BrokerImpl {
         .await
     }
 
+    async fn consume_bw_token(
+        &self,
+        token: ClientToken,
+        sig: SingleUnblindedSignature,
+    ) -> Result<(), AuthError> {
+        BW_MIZARU_SK
+            .to_public_key()
+            .blind_verify(token, &sig)
+            .map_err(|_| AuthError::Forbidden)?;
+        // TODO prevent replays by writing to a DB. This requires something smarter than stuffing it into postgresql and causing a neverending log.
+        Ok(())
+    }
+
     async fn insert_exit(
         &self,
-        descriptor: Mac<Signed<ExitDescriptor>>,
+        descriptor: Mac<StdcodeSigned<ExitDescriptor>>,
     ) -> Result<(), GenericError> {
         let descriptor =
             descriptor.verify(blake3::hash(CONFIG_FILE.wait().exit_token.as_bytes()).as_bytes())?;
@@ -409,30 +470,59 @@ impl BrokerProtocol for BrokerImpl {
             country: descriptor.country.alpha2().into(),
             city: descriptor.city.clone(),
             load: descriptor.load,
-            expiry: (now + 10) as _,
+            expiry: (now + 60) as _,
         };
         insert_exit(&exit).await?;
         Ok(())
+    }
+
+    async fn insert_exit_v2(
+        &self,
+        descriptor: Mac<JsonSigned<(ExitDescriptor, ExitMetadata)>>,
+    ) -> Result<(), GenericError> {
+        let descriptor =
+            descriptor.verify(blake3::hash(CONFIG_FILE.wait().exit_token.as_bytes()).as_bytes())?;
+        let pubkey = descriptor.pubkey();
+        let (descriptor, metadata) = descriptor.verify(DOMAIN_EXIT_DESCRIPTOR, |_| true)?;
+
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        if descriptor.expiry < now {
+            return Err(GenericError(
+                "Exit info timestamp is before current time (potential replay attack)".to_string(),
+            ));
+        }
+
+        let exit = ExitRow {
+            pubkey: pubkey.to_bytes(),
+            c2e_listen: descriptor.c2e_listen.to_string(),
+            b2e_listen: descriptor.b2e_listen.to_string(),
+            country: descriptor.country.alpha2().into(),
+            city: descriptor.city.clone(),
+            load: descriptor.load,
+            expiry: (now + 60) as _,
+        };
+        insert_exit(&exit).await?;
+        insert_exit_metadata(pubkey.to_bytes(), metadata).await?;
+        Ok(())
+    }
+
+    async fn get_net_status(&self) -> Result<JsonSigned<NetStatus>, GenericError> {
+        let ns = self.net_status_inner().await?;
+        Ok(JsonSigned::new(
+            ns,
+            DOMAIN_NET_STATUS,
+            MASTER_SECRET.deref(),
+        ))
     }
 
     async fn insert_bridge(&self, descriptor: Mac<BridgeDescriptor>) -> Result<(), GenericError> {
         let descriptor = descriptor
             .verify(blake3::hash(CONFIG_FILE.wait().bridge_token.as_bytes()).as_bytes())?;
         tracing::debug!("inserting bridge from pool {}", descriptor.pool);
-        sqlx::query(
-            r#"
-            INSERT INTO bridges_new (listen, cookie, pool, expiry)
-            VALUES ($1, $2, $3, $4)
-            ON CONFLICT (listen) DO UPDATE
-            SET cookie = $2, pool = $3, expiry = $4
-            "#,
-        )
-        .bind(descriptor.control_listen.to_string())
-        .bind(descriptor.control_cookie.to_string())
-        .bind(descriptor.pool.to_string())
-        .bind(descriptor.expiry as i64)
-        .execute(&*POSTGRES)
-        .await?;
+        crate::database::bridges::insert_bridge(&descriptor).await?;
         Ok(())
     }
 
@@ -452,27 +542,10 @@ impl BrokerProtocol for BrokerImpl {
         smolscale::spawn(
             async move {
                 let current_timestamp = SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap()
-                .as_secs() as i64;
-                let mut txn = POSTGRES.begin().await?;
-                let up_time: Option<(i64,)> = sqlx::query_as("select last_update from bridge_availability where listen = $1 and user_country = $2 and user_asn = $3").bind(&data.listen).bind(&data.country).bind(&data.asn).fetch_optional(&mut *txn).await?;
-                if let Some((up_time,)) = up_time {
-                    let diff = current_timestamp.saturating_sub(up_time) as f64;
-                    // 1-hour decay interval
-                    let decay_factor = 2.0f64.powf(diff / 3600.0);
-                    if data.success {
-                        sqlx::query("update bridge_availability set successes = successes / $1 + 1, last_update = $2 where listen = $3 and user_country = $4 and user_asn = $5").bind(decay_factor).bind(current_timestamp).bind(&data.listen).bind(&data.country).bind(&data.asn).execute(&mut *txn).await?;
-                    } else {
-                        sqlx::query("update bridge_availability set failures = failures / $1 + 1, last_update = $2 where listen = $3 and user_country = $4 and user_asn = $5").bind(decay_factor).bind(current_timestamp).bind(&data.listen).bind(&data.country).bind(&data.asn).execute(&mut *txn).await?;
-                    }
-                } else if data.success {
-                    sqlx::query("insert into bridge_availability (listen, user_country, user_asn, successes, failures, last_update) values ($1, $2, $3, 1.0, 0.0, $4)").bind(&data.listen).bind(&data.country).bind(&data.asn).bind(current_timestamp).execute(&mut *txn).await?;
-                } else {
-                    sqlx::query("insert into bridge_availability (listen, user_country, user_asn, successes, failures, last_update) values ($1, $2, $3, 0.0, 1.0, $4)").bind(&data.listen).bind(&data.country).bind(&data.asn).bind(current_timestamp).execute(&mut *txn).await?;
-                }
-                txn.commit().await?;
-                anyhow::Ok(())
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap()
+                    .as_secs() as i64;
+                crate::database::bridges::record_availability(data).await
             }
             .inspect_err(|e| tracing::warn!(err = debug(e), "setting availability failed")),
         )
@@ -499,14 +572,32 @@ impl BrokerProtocol for BrokerImpl {
             .await
     }
 
-    async fn get_news(&self, lang: String) -> Result<Vec<NewsItem>, GenericError> {
+    async fn delete_account(&self, secret: String) -> Result<(), GenericError> {
+        // validate secret; get user_id
+        let user_id = validate_secret(&secret).await?;
+        // cancel stripe
+        let rpc = PaymentClient(PaymentTransport);
+        let sessid = payment_sessid(user_id).await?;
+        rpc.cancel_recurring(sessid).await?.map_err(GenericError)?;
+        // delete for good
+        crate::database::auth::delete_user_by_secret(&secret).await?;
+        Ok(())
+    }
+
+    async fn get_news(&self, lang: String) -> Result<Vec<LegacyNewsItem>, GenericError> {
         let (send, recv) = oneshot::channel();
         smolscale::spawn(async move { send.send(fetch_news(&lang).await) }).detach();
         recv.await.unwrap().map_err(|e: anyhow::Error| e.into())
     }
 
     async fn raw_price_points(&self) -> Result<Vec<(u32, u32)>, GenericError> {
-        Ok(vec![(30, 500), (90, 1500), (365, 5475), (730, 10342)])
+        Ok(vec![
+            (7, 150),
+            (30, 500),
+            (90, 1500),
+            (365, 5475),
+            (730, 10342),
+        ])
     }
 
     async fn payment_methods(&self) -> Result<Vec<String>, GenericError> {
@@ -587,6 +678,9 @@ impl BrokerProtocol for BrokerImpl {
         // Get a payment session for the user
         let sessid = payment_sessid(user_id).await?;
 
+        // Delete the free voucher after successful redemption
+        delete_free_voucher(user_id).await?;
+
         // Call the payment service to spend the gift card
         let days = PaymentClient(PaymentTransport)
             .spend_giftcard(
@@ -598,9 +692,6 @@ impl BrokerProtocol for BrokerImpl {
             )
             .await?
             .map_err(|e| GenericError(format!("Failed to redeem voucher: {}", e)))?;
-
-        // Delete the free voucher after successful redemption
-        delete_free_voucher(user_id).await?;
 
         // Return the number of days credited to the account
         Ok(days)
